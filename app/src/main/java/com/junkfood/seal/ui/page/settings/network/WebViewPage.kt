@@ -231,20 +231,37 @@ fun WebViewPage(cookiesViewModel: CookiesViewModel, onDismissRequest: () -> Unit
                             javaScriptCanOpenWindowsAutomatically = true
                             mediaPlaybackRequiresUserGesture = false
 
-                            // Report the truth: the stock WebView User-Agent, " wv" token
-                            // included, and the stock Sec-CH-UA metadata. No header or JS
-                            // override is applied any more — see USER-AGENT POLICY above.
+                            // -----------------------------------------------------------------
+                            // Mobile Chrome UA, single-layer change.
                             //
-                            // Douyin is the single exception: its login page sends mobile
-                            // clients straight to the download page, so it is opened as a
-                            // desktop Chrome session (issue #27).
-                            val stockUA = userAgentString
+                            // Two earlier strategies both failed on bilibili:
+                            //
+                            //   A. stocks UA + fake window.chrome + fake Sec-CH-UA
+                            //      -> contradictions detected, risk-control page.
+                            //   B. stock WebView UA ("wv" token kept) + nothing faked
+                            //      -> bilibili serves the page skeleton but withholds the
+                            //         text/layout layer; feed shows cover images only.
+                            //
+                            // This variant changes exactly ONE thing: the User-Agent string
+                            // loses the " wv" token, so the site takes its ordinary mobile-
+                            // Chrome path. Everything else stays native and self-consistent:
+                            //   * Sec-CH-UA metadata is NOT overridden (stock WebView value)
+                            //   * navigator.userAgentData is NOT patched
+                            //   * no JavaScript is injected on any origin
+                            //
+                            // Nothing is impersonated beyond the UA string itself, so the
+                            // client cannot contradict itself the way strategy A did.
+                            // -----------------------------------------------------------------
+                            val mobileChromeUA = userAgentString.replace(Regex("\\swv\\b"), "")
+                            // Douyin sends mobile clients straight to its download page, so it
+                            // is opened as a desktop Chrome session instead (issue #27).
                             val desktopLogin = websiteUrl.contains("douyin.com", ignoreCase = true)
-                            setUserAgentString(if (desktopLogin) DESKTOP_CHROME_UA else stockUA)
+                            val effectiveUA = if (desktopLogin) DESKTOP_CHROME_UA else mobileChromeUA
+                            setUserAgentString(effectiveUA)
 
-                            // Persisted for yt-dlp. Use the same value the WebView actually
-                            // sends, so cookies obtained here are replayed with a matching UA.
-                            USER_AGENT_STRING.updateString(if (desktopLogin) DESKTOP_CHROME_UA else stockUA)
+                            // Persisted for yt-dlp so replayed requests use the same UA the
+                            // cookies were issued to.
+                            USER_AGENT_STRING.updateString(effectiveUA)
                         }
 
                         cookieManager.setAcceptCookie(true)
