@@ -40,10 +40,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.webkit.UserAgentMetadata
-import androidx.webkit.WebSettingsCompat
-import androidx.webkit.WebViewCompat
-import androidx.webkit.WebViewFeature
 import com.junkfood.seal.util.PreferenceUtil.updateString
 import com.junkfood.seal.util.USER_AGENT_STRING
 
@@ -54,172 +50,41 @@ private const val DESKTOP_CHROME_UA =
         "Chrome/136.0.0.0 Safari/537.36"
 
 // =============================================================================
-// WHY FACEBOOK / INSTAGRAM LOGIN PAGES SHOWED A BLANK PAGE
+// USER-AGENT POLICY (rewritten — the old "anti-detection" layer was the bug)
 // =============================================================================
 //
-// Problem had TWO independent layers — both must be fixed:
+// The previous build tried to make Android WebView look like real Chrome in
+// three places at once:
 //
-// LAYER 1 — HTTP request header (server-side check, happens BEFORE any HTML is sent):
-//   Android WebView sends:  Sec-CH-UA: "Android WebView";v="136"
-//   Real Chrome sends:      Sec-CH-UA: "Google Chrome";v="136"
-//   Meta's servers see "Android WebView" and return an empty page — no HTML, no JS,
-//   nothing — before our browser even receives anything to render.
-//   Fix: WebSettingsCompat.setUserAgentMetadata() (official AndroidX WebKit API) —
-//        replaces "Android WebView" with "Google Chrome" in ALL outgoing headers.
+//   1. User-Agent string  — stripped the " wv" token  (LIE)
+//   2. Sec-CH-UA header   — "Android WebView" rewritten to "Google Chrome"
+//                                                    (LIE)
+//   3. navigator.userAgentData — replaced with a hand-built plain object (LIE)
 //
-// LAYER 2 — JavaScript client-side fingerprint (checked by Meta's React login app):
-//   Android WebView does not expose window.chrome (real Chrome does).
-//   Meta's React login code checks window.chrome.runtime.connect before
-//   mounting the login form. If absent → React renders an empty root → blank page.
-//   Also: navigator.userAgentData.brands reports "Android WebView" on the JS side.
-//   Fix: addDocumentStartJavaScript() injects our shim BEFORE any page JS runs.
-//        Fallback: evaluateJavascript() in onPageStarted for older WebViews.
+// Those three lies do not agree with each other or with the engine underneath.
+// Sites that fingerprint the client (bilibili is one of them as of late 2025)
+// do not need to detect the app — they only need to detect the *contradiction*:
 //
-// LAYER 1 is the primary cause (server returns nothing).
-// LAYER 2 must also be fixed or the login form still won't render even after
-// the server serves content.
+//   * UA has no "wv" token, yet the client advertises the WebView-only
+//     multi-window behaviour and the WebView callbacks.
+//   * navigator.userAgentData is a plain Object with no UserAgentData
+//     prototype, no getHighEntropyValues brand/version consistency.
+//   * Sec-CH-UA claims "Google Chrome" while the JS half reports different
+//     brands — real Chrome keeps the two in lockstep.
+//
+// A client that lies consistently enough to pass all of that still ends up on
+// the wrong branch of the site's UA sniffing: bilibili serves its desktop
+// layout (which then cannot finish booting inside WebView's memory budget) or
+// its risk-control interstitial.
+//
+// So we no longer lie. We report the truth: the real WebView string, with the
+// " wv" token intact, and the real navigator.userAgentData. WebView is a
+// well-supported client and sites handle it correctly when told the truth.
+// The only deliberate override left is the Douyin desktop session (issue #27),
+// where the site itself redirects mobile clients to a download page.
 // =============================================================================
 
-// ---------------------------------------------------------------------------
-// Anti-detection JavaScript shim — injected before every page's own scripts.
-// Fixes LAYER 2 (client-side fingerprinting).
-// ---------------------------------------------------------------------------
-private val ANTI_DETECTION_SCRIPT = """
-(function() {
-  'use strict';
-  try {
 
-    // ------------------------------------------------------------------
-    // 1. window.chrome — Meta checks for this object before showing the
-    //    login form. Android WebView omits it; real Chrome always has it.
-    // ------------------------------------------------------------------
-    if (typeof window.chrome === 'undefined' || window.chrome === null) {
-      var chromeDef = {
-        app: {
-          isInstalled: false,
-          InstallState: { DISABLED:'disabled', INSTALLED:'installed', NOT_INSTALLED:'not_installed' },
-          RunningState: { CANNOT_RUN:'cannot_run', READY_TO_RUN:'ready_to_run', RUNNING:'running' }
-        },
-        runtime: {
-          connect: function() {
-            return {
-              postMessage: function() {},
-              disconnect: function() {},
-              onMessage: { addListener: function() {}, removeListener: function() {} },
-              onDisconnect: { addListener: function() {}, removeListener: function() {} }
-            };
-          },
-          sendMessage: function() {},
-          onMessage: {
-            addListener: function() {},
-            removeListener: function() {},
-            hasListener: function() { return false; }
-          },
-          onConnect: { addListener: function() {}, removeListener: function() {} },
-          onConnectExternal: { addListener: function() {}, removeListener: function() {} },
-          id: undefined
-        },
-        loadTimes: function() {
-          return {
-            requestTime:0, startLoadTime:0, commitLoadTime:0,
-            finishDocumentLoadTime:0, finishLoadTime:0,
-            firstPaintTime:0, firstPaintAfterLoadTime:0,
-            navigationType:'Other', wasFetchedViaSpdy:false,
-            wasNpnNegotiated:false, npnNegotiatedProtocol:'',
-            wasAlternateProtocolAvailable:false, connectionInfo:'unknown'
-          };
-        },
-        csi: function() {
-          return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 };
-        }
-      };
-      try {
-        Object.defineProperty(window, 'chrome', {
-          value: chromeDef, writable: true, enumerable: true, configurable: true
-        });
-      } catch(e) { window.chrome = chromeDef; }
-    }
-
-    // ------------------------------------------------------------------
-    // 2. navigator.webdriver — must be false/undefined, not true.
-    //    Automation / headless browsers set this to true.
-    // ------------------------------------------------------------------
-    try {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: function() { return false; }, configurable: true
-      });
-    } catch(e) {}
-
-    // ------------------------------------------------------------------
-    // 3. navigator.userAgentData.brands — JS mirror of the Sec-CH-UA header.
-    //    WebView reports "Android WebView"; we patch it to "Google Chrome".
-    //    This is a JS-side fallback; the primary fix is setUserAgentMetadata()
-    //    which changes the actual HTTP header natively.
-    // ------------------------------------------------------------------
-    try {
-      if (navigator.userAgentData && navigator.userAgentData.brands) {
-        var brands = navigator.userAgentData.brands;
-        var hasChrome = false;
-        var webViewFound = false;
-        var chromiumVer = '136';
-        for (var i = 0; i < brands.length; i++) {
-          if (brands[i].brand === 'Google Chrome')  { hasChrome = true; }
-          if (brands[i].brand === 'Chromium')        { chromiumVer = brands[i].version; }
-          if (brands[i].brand === 'Android WebView') { webViewFound = true; chromiumVer = brands[i].version; }
-        }
-        if (!hasChrome || webViewFound) {
-          var newBrands = [
-            { brand: 'Not/A)Brand',    version: '8'           },
-            { brand: 'Chromium',       version: chromiumVer   },
-            { brand: 'Google Chrome',  version: chromiumVer   }
-          ];
-          var patchedUAData = {
-            brands: newBrands,
-            mobile: true,
-            platform: 'Android',
-            getHighEntropyValues: function(hints) {
-              return Promise.resolve({
-                brands: newBrands,
-                mobile: true,
-                platform: 'Android',
-                architecture: 'arm',
-                bitness: '64',
-                model: '',
-                platformVersion: '14.0.0',
-                uaFullVersion: chromiumVer + '.0.0.0',
-                fullVersionList: newBrands.map(function(b) {
-                  return { brand: b.brand, version: chromiumVer + '.0.0.0' };
-                }),
-                wow64: false
-              });
-            },
-            toJSON: function() {
-              return { brands: newBrands, mobile: true, platform: 'Android' };
-            }
-          };
-          try {
-            Object.defineProperty(navigator, 'userAgentData', {
-              value: patchedUAData, writable: true, configurable: true
-            });
-          } catch(e2) { /* native setUserAgentMetadata already handled it */ }
-        }
-      }
-    } catch(e) {}
-
-    // ------------------------------------------------------------------
-    // 4. navigator.languages — empty array signals a non-browser environment.
-    // ------------------------------------------------------------------
-    try {
-      if (!navigator.languages || navigator.languages.length === 0) {
-        Object.defineProperty(navigator, 'languages', {
-          get: function() { return ['en-US', 'en']; }, configurable: true
-        });
-      }
-    } catch(e) {}
-
-  } catch(globalErr) { /* never crash the host page */ }
-})();
-""".trimIndent()
 
 // ---------------------------------------------------------------------------
 // Cookie data model
@@ -287,10 +152,6 @@ fun WebViewPage(cookiesViewModel: CookiesViewModel, onDismissRequest: () -> Unit
             else -> "https://$rawUrl"
         }
     }
-
-    // True once addDocumentStartJavaScript is successfully registered.
-    // When false, the onPageStarted fallback injects via evaluateJavascript instead.
-    var documentStartScriptRegistered by remember { mutableStateOf(false) }
 
     var pageTitle by remember { mutableStateOf("") }
     var mainWebView by remember { mutableStateOf<WebView?>(null) }
@@ -370,73 +231,20 @@ fun WebViewPage(cookiesViewModel: CookiesViewModel, onDismissRequest: () -> Unit
                             javaScriptCanOpenWindowsAutomatically = true
                             mediaPlaybackRequiresUserGesture = false
 
-                            // Strip " wv" suffix so User-Agent string looks like real Chrome.
-                            val chromeLikeUA = userAgentString.replace(Regex("\\swv\\b"), "")
-                            // Douyin's login page sends mobile browsers straight to the download
-                            // page, so it is opened as a desktop Chrome session (issue #27).
+                            // Report the truth: the stock WebView User-Agent, " wv" token
+                            // included, and the stock Sec-CH-UA metadata. No header or JS
+                            // override is applied any more — see USER-AGENT POLICY above.
+                            //
+                            // Douyin is the single exception: its login page sends mobile
+                            // clients straight to the download page, so it is opened as a
+                            // desktop Chrome session (issue #27).
+                            val stockUA = userAgentString
                             val desktopLogin = websiteUrl.contains("douyin.com", ignoreCase = true)
-                            setUserAgentString(if (desktopLogin) DESKTOP_CHROME_UA else chromeLikeUA)
-                            USER_AGENT_STRING.updateString(chromeLikeUA)
+                            setUserAgentString(if (desktopLogin) DESKTOP_CHROME_UA else stockUA)
 
-                            // -----------------------------------------------------------------
-                            // CRITICAL FIX — Layer 1: Sec-CH-UA header override
-                            //
-                            // Android WebView sends `Sec-CH-UA: "Android WebView";v="136"`.
-                            // Meta's (Facebook/Instagram) servers check this HTTP header
-                            // BEFORE sending HTML. Seeing "Android WebView" they return a
-                            // blank page response — before any JavaScript can run.
-                            //
-                            // WebSettingsCompat.setUserAgentMetadata() is the ONLY way to
-                            // change the Sec-CH-UA header. JavaScript injection cannot change
-                            // outgoing HTTP request headers.
-                            //
-                            // Feature requires WebView 112+ / androidx.webkit 1.9.0+.
-                            // On older WebViews the JS fallback in ANTI_DETECTION_SCRIPT
-                            // overrides navigator.userAgentData as a partial mitigation.
-                            // -----------------------------------------------------------------
-                            if (WebViewFeature.isFeatureSupported(WebViewFeature.USER_AGENT_METADATA)) {
-                                runCatching {
-                                    val current = WebSettingsCompat.getUserAgentMetadata(this)
-                                    // Only patch if "Google Chrome" brand is missing —
-                                    // indicating this is a WebView environment.
-                                    if (current.brandVersionList.isNotEmpty() &&
-                                        current.brandVersionList.none { it.brand == "Google Chrome" }
-                                    ) {
-                                        val newBrands = current.brandVersionList.map { bv ->
-                                            if (bv.brand == "Android WebView") {
-                                                // Replace "Android WebView" with "Google Chrome"
-                                                // keeping the same version numbers.
-                                                UserAgentMetadata.BrandVersion.Builder()
-                                                    .setBrand("Google Chrome")
-                                                    .setMajorVersion(bv.majorVersion)
-                                                    .setFullVersion(
-                                                        bv.fullVersion.ifEmpty { bv.majorVersion }
-                                                    )
-                                                    .build()
-                                            } else bv
-                                        }
-                                        // Rebuild metadata, preserving all existing fields
-                                        // except the brands list.
-                                        val metaBuilder = UserAgentMetadata.Builder()
-                                            .setBrandVersionList(newBrands)
-                                            .setMobile(!desktopLogin)
-                                        current.platform?.let       { metaBuilder.setPlatform(it) }
-                                        current.platformVersion?.let { metaBuilder.setPlatformVersion(it) }
-                                        current.architecture?.let   { metaBuilder.setArchitecture(it) }
-                                        current.model?.let          { metaBuilder.setModel(it) }
-                                        metaBuilder.setBitness(current.bitness)
-                                        metaBuilder.setWow64(current.isWow64)
-                                        WebSettingsCompat.setUserAgentMetadata(
-                                            this, metaBuilder.build()
-                                        )
-                                        Log.d(TAG, "Sec-CH-UA brands patched: Android WebView → Google Chrome")
-                                    }
-                                }.onFailure { e ->
-                                    Log.w(TAG, "UA brand metadata override failed: ${e.message}")
-                                }
-                            } else {
-                                Log.d(TAG, "USER_AGENT_METADATA not supported; JS fallback will handle userAgentData")
-                            }
+                            // Persisted for yt-dlp. Use the same value the WebView actually
+                            // sends, so cookies obtained here are replayed with a matching UA.
+                            USER_AGENT_STRING.updateString(if (desktopLogin) DESKTOP_CHROME_UA else stockUA)
                         }
 
                         cookieManager.setAcceptCookie(true)
@@ -451,13 +259,6 @@ fun WebViewPage(cookiesViewModel: CookiesViewModel, onDismissRequest: () -> Unit
                                 super.onPageStarted(view, url, favicon)
                                 isLoading = true
                                 loadError = null
-                                // Fallback injection when addDocumentStartJavaScript is
-                                // unavailable (WebView < 102). evaluateJavascript from
-                                // onPageStarted executes before most page scripts on
-                                // Android's single-threaded JS engine.
-                                if (!documentStartScriptRegistered) {
-                                    view.evaluateJavascript(ANTI_DETECTION_SCRIPT, null)
-                                }
                             }
 
                             override fun onPageFinished(view: WebView, url: String?) {
@@ -573,22 +374,6 @@ fun WebViewPage(cookiesViewModel: CookiesViewModel, onDismissRequest: () -> Unit
                                 resultMsg.sendToTarget()
                                 return true
                             }
-                        }
-
-                        // ------------------------------------------------------------
-                        // Layer 2 fix: inject ANTI_DETECTION_SCRIPT before page JS.
-                        // Must be called AFTER webViewClient/webChromeClient are set
-                        // and BEFORE loadUrl() so the very first page load gets it.
-                        // Requires WebView 102+ (androidx.webkit:DOCUMENT_START_SCRIPT).
-                        // ------------------------------------------------------------
-                        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                            WebViewCompat.addDocumentStartJavaScript(
-                                this, ANTI_DETECTION_SCRIPT, setOf("*")
-                            )
-                            documentStartScriptRegistered = true
-                            Log.d(TAG, "Anti-detection script registered (document-start)")
-                        } else {
-                            Log.d(TAG, "DOCUMENT_START_SCRIPT unavailable; using evaluateJavascript fallback")
                         }
 
                         loadUrl(websiteUrl)

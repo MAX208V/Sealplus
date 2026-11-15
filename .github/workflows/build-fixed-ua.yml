@@ -1,0 +1,70 @@
+name: Build Fixed-UA APK
+
+# Standalone build: no repository secrets required.
+# The previous workflow (android.yml) needs ANDROID_SIGNING_KEY and friends
+# because it publishes signed releases. This one only needs to produce an APK
+# you can sideload, so it signs with an ephemeral debug keystore generated on
+# the runner.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "ua-fix" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Generate throwaway signing keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/ua-fix.jks" \
+            -alias ua-fix \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass uafix123 -keypass uafix123 \
+            -dname "CN=UA Fix, OU=Local, O=Local, L=Local, S=Local, C=US"
+
+          # Values must start at column 0: a plain (unquoted-in-Kotlin) Properties
+          # value keeps leading whitespace, which would break the keystore path.
+          printf 'keyAlias=%s\n'       ua-fix                      > keystore.properties
+          printf 'keyPassword=%s\n'    uafix123                    >> keystore.properties
+          printf 'storeFile=%s\n'      "$GITHUB_WORKSPACE/ua-fix.jks" >> keystore.properties
+          printf 'storePassword=%s\n'  uafix123                    >> keystore.properties
+
+      - name: Build release APK (arm64-v8a)
+        run: |
+          ./gradlew assembleRelease --no-daemon \
+            -PABI_FILTERS=arm64-v8a \
+            -x lint \
+            --stacktrace
+
+      - name: Show build output
+        if: always()
+        run: |
+          find app/build/outputs/apk -name "*.apk" -exec ls -lh {} \; || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SealPlus-ua-fix-arm64-v8a
+          path: app/build/outputs/apk/generic/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
